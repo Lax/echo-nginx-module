@@ -1,0 +1,4 @@
+[submodule "echo-nginx-module"]
+	path = echo-nginx-module
+	url = https://github.com/openresty/echo-nginx-module.git
+	branch = master
