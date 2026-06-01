@@ -1,0 +1,127 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - '*-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      module_name: ${{ steps.parse.outputs.module_name }}
+      tag_version: ${{ steps.parse.outputs.tag_version }}
+      sub_version: ${{ steps.parse.outputs.sub_version }}
+      is_prerelease: ${{ steps.parse.outputs.is_prerelease }}
+      nginx_version: ${{ steps.nginx.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GH_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Parse module name from tag
+        id: parse
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag_version=$TAG" >> "$GITHUB_OUTPUT"
+          MODULE_LIST=$(sed -n 's/.*\[submodule "\(.*\)"\]/\1/p' .gitmodules \
+            | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-)
+          MODULE=""
+          for mod in $MODULE_LIST; do
+            if [[ "$TAG" == "$mod-"* ]]; then
+              MODULE="$mod"
+              break
+            fi
+          done
+          if [ -z "$MODULE" ]; then
+            echo "Error: no submodule matches tag $TAG"
+            exit 1
+          fi
+          echo "module_name=$MODULE" >> "$GITHUB_OUTPUT"
+
+          VERSION="${TAG#${MODULE}-}"
+          echo "sub_version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-snapshot ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build nginx module (Docker)
+        run: |
+          docker build \
+            --build-arg MODULE_NAME="${{ steps.parse.outputs.module_name }}" \
+            -t nginx-module-builder \
+            .
+
+      - name: Extract .so files
+        run: |
+          mkdir -p dist
+          docker create --name extract nginx-module-builder
+          docker cp extract:/build/nginx-src/objs/. dist/
+          docker rm extract
+          ls -la dist/
+
+      - name: Get nginx version
+        id: nginx
+        run: |
+          NGINX_VERSION=$(docker run --rm --entrypoint sh nginx-module-builder -c 'nginx -v 2>&1' | cut -d/ -f2)
+          echo "version=$NGINX_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.so > SHA256SUMS
+
+      - name: Generate release body
+        run: |
+          SO_FILE=$(ls dist/*.so | head -1 | xargs basename)
+          TAG="${{ steps.parse.outputs.tag_version }}"
+          SUM=$(cat dist/SHA256SUMS)
+          {
+            echo "|          |                              |"
+            echo "|----------|------------------------------|"
+            echo "| Module   | ${{ steps.parse.outputs.module_name }} |"
+            echo "| Version  | ${{ steps.parse.outputs.sub_version }} |"
+            echo "| Nginx    | ${{ steps.nginx.outputs.version }} |"
+            echo "| Built at | $(date -u '+%Y-%m-%d %H:%M UTC') |"
+            echo "| Download | [${SO_FILE}](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${SO_FILE}) |"
+            echo ""
+            echo '```'
+            echo "${SUM}"
+            echo '```'
+          } > dist/release-body.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.parse.outputs.module_name }}-so
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.module_name }}-so
+          path: dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag_version }}
+          name: ${{ needs.build.outputs.tag_version }}
+          body_path: dist/release-body.md
+          prerelease: ${{ needs.build.outputs.is_prerelease }}
+          files: |
+            dist/*.so
+            dist/SHA256SUMS
+          generate_release_notes: false
+          token: ${{ secrets.GH_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}

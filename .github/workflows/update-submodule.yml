@@ -1,0 +1,92 @@
+name: Update Submodules
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+          token: ${{ secrets.GH_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Setup git config
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Derive submodule branch
+        id: branch
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          SUB="${BRANCH#docker/}"
+          SUB="${SUB#dockerize/}"
+          echo "current_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "sub_branch=$SUB" >> "$GITHUB_OUTPUT"
+
+      - name: Fix .gitmodules branch if needed
+        run: |
+          SUB_BRANCH="${{ steps.branch.outputs.sub_branch }}"
+          NEEDS_FIX=false
+          while IFS= read -r line; do
+            NAME=$(echo "$line" | sed -n 's/.*\[submodule "\(.*\)"\]/\1/p')
+            [ -z "$NAME" ] && continue
+            CURRENT=$(git config -f .gitmodules submodule."$NAME".branch || echo "")
+            if [ "$CURRENT" != "$SUB_BRANCH" ]; then
+              git config -f .gitmodules submodule."$NAME".branch "$SUB_BRANCH"
+              NEEDS_FIX=true
+            fi
+          done < .gitmodules
+          if [ "$NEEDS_FIX" = "true" ]; then
+            git add .gitmodules
+            git commit -m "fix: set submodule branch to ${SUB_BRANCH}"
+            git push
+          fi
+
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
+
+      - name: Check for submodule updates
+        id: check
+        run: |
+          CHANGED=""
+          while IFS= read -r line; do
+            NAME=$(echo "$line" | sed -n 's/.*\[submodule "\(.*\)"\]/\1/p')
+            [ -z "$NAME" ] && continue
+            OLD=$(git submodule status "$NAME" | awk '{print substr($1,1,1) == "-" ? substr($1,2) : $1}')
+            git submodule update --remote "$NAME"
+            NEW=$(git submodule status "$NAME" | awk '{print substr($1,1,1) == "-" ? substr($1,2) : $1}')
+            if [ "$OLD" != "$NEW" ]; then
+              CHANGED="$CHANGED $NAME"
+            fi
+          done < .gitmodules
+          echo "modules=${CHANGED# }" >> "$GITHUB_OUTPUT"
+
+      - name: Commit submodule updates
+        if: steps.check.outputs.modules != ''
+        run: |
+          git add -A
+          git commit -m "chore: update submodules"
+          git push
+
+      - name: Generate and push tags
+        if: steps.check.outputs.modules != ''
+        env:
+          MODULES: ${{ steps.check.outputs.modules }}
+        run: |
+          for NAME in $MODULES; do
+            cd "$NAME"
+            TAG=$(git describe --exact-match HEAD 2>/dev/null || echo "v$(date +%Y%m%d)-snapshot")
+            cd "$GITHUB_WORKSPACE"
+            FULL_TAG="${NAME}-${TAG}"
+            git tag -f "$FULL_TAG"
+            git push origin "$FULL_TAG" --force
+          done
