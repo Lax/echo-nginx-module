@@ -9,20 +9,17 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
     outputs:
       module_name: ${{ steps.parse.outputs.module_name }}
       tag_version: ${{ steps.parse.outputs.tag_version }}
       sub_version: ${{ steps.parse.outputs.sub_version }}
       is_prerelease: ${{ steps.parse.outputs.is_prerelease }}
-      nginx_version: ${{ steps.nginx.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive
-          token: ${{ secrets.GH_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Parse module name from tag
         id: parse
@@ -52,10 +49,24 @@ jobs:
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        nginx-branch: [mainline, stable]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GH_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}
+
       - name: Build nginx module (Docker)
         run: |
           docker build \
-            --build-arg MODULE_NAME="${{ steps.parse.outputs.module_name }}" \
+            --build-arg NGINX_BRANCH=${{ matrix.nginx-branch }} \
+            --build-arg MODULE_NAME="${{ needs.prepare.outputs.module_name }}" \
             -t nginx-module-builder \
             .
 
@@ -65,13 +76,39 @@ jobs:
           docker create --name extract nginx-module-builder
           docker cp extract:/build/nginx-src/objs/. dist/
           docker rm extract
-          ls -la dist/
 
       - name: Get nginx version
         id: nginx
         run: |
           NGINX_VERSION=$(docker run --rm --entrypoint sh nginx-module-builder -c 'nginx -v 2>&1' | cut -d/ -f2)
           echo "version=$NGINX_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rename .so with nginx version
+        run: |
+          cd dist
+          for f in *.so; do
+            [ -f "$f" ] || continue
+            stem="${f%.so}"
+            mv "$f" "${stem}-nginx-${{ steps.nginx.outputs.version }}.so"
+          done
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.module_name }}-so-${{ matrix.nginx-branch }}
+          path: dist/
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.prepare.outputs.module_name }}-so-*
+          path: dist/
+          merge-multiple: true
 
       - name: Generate SHA256SUMS
         run: |
@@ -80,46 +117,33 @@ jobs:
 
       - name: Generate release body
         run: |
-          SO_FILE=$(ls dist/*.so | head -1 | xargs basename)
-          TAG="${{ steps.parse.outputs.tag_version }}"
-          SUM=$(cat dist/SHA256SUMS)
+          MODULE="${{ needs.prepare.outputs.module_name }}"
+          TAG="${{ needs.prepare.outputs.tag_version }}"
+          VERSION="${{ needs.prepare.outputs.sub_version }}"
+          SO_FILES=$(ls dist/*.so)
           {
-            echo "|          |                              |"
-            echo "|----------|------------------------------|"
-            echo "| Module   | ${{ steps.parse.outputs.module_name }} |"
-            echo "| Version  | ${{ steps.parse.outputs.sub_version }} |"
-            echo "| Nginx    | ${{ steps.nginx.outputs.version }} |"
-            echo "| Built at | $(date -u '+%Y-%m-%d %H:%M UTC') |"
-            echo "| Download | [${SO_FILE}](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${SO_FILE}) |"
+            echo "## $MODULE v$VERSION"
+            echo ""
+            echo "| Nginx | File |"
+            echo "|---|---|"
+            for f in $SO_FILES; do
+              BASENAME=$(basename "$f")
+              NGX_VER=$(echo "$BASENAME" | sed 's/.*-nginx-\(.*\)\.so/\1/')
+              echo "| $NGX_VER | [$BASENAME](https://github.com/${{ github.repository }}/releases/download/${TAG}/${BASENAME}) |"
+            done
             echo ""
             echo '```'
-            echo "${SUM}"
+            cat dist/SHA256SUMS
             echo '```'
           } > dist/release-body.md
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.parse.outputs.module_name }}-so
-          path: dist/
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.build.outputs.module_name }}-so
-          path: dist/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.build.outputs.tag_version }}
-          name: ${{ needs.build.outputs.tag_version }}
+          tag_name: ${{ needs.prepare.outputs.tag_version }}
+          name: ${{ needs.prepare.outputs.tag_version }}
           body_path: dist/release-body.md
-          prerelease: ${{ needs.build.outputs.is_prerelease }}
+          prerelease: ${{ needs.prepare.outputs.is_prerelease }}
           files: |
             dist/*.so
             dist/SHA256SUMS

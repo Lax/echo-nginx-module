@@ -1,4 +1,5 @@
-FROM nginx:mainline-alpine AS builder
+ARG NGINX_BRANCH=mainline
+FROM nginx:${NGINX_BRANCH}-alpine AS builder
 
 RUN apk add --no-cache \
     build-base \
