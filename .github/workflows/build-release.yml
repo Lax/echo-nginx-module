@@ -74,7 +74,7 @@ jobs:
         run: |
           mkdir -p dist
           docker create --name extract nginx-module-builder
-          docker cp extract:/build/nginx-src/objs/. dist/
+          docker cp extract:/build/artifacts/. dist/
           docker rm extract
 
       - name: Get nginx version

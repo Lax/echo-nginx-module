@@ -1,0 +1,3 @@
+traffic-accounting-nginx-module|combined|--with-stream
+traffic-accounting-nginx-module|http-only|
+traffic-accounting-nginx-module|stream-only|--without-http --with-stream
